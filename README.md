@@ -1,5 +1,12 @@
 # pico-tunnel
 
+![Powerby hifar](https://img.shields.io/badge/powerby-hifar-ff6b6b?style=for-the-badge)
+![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?style=for-the-badge&logo=rust)
+![Tokio](https://img.shields.io/badge/Tokio-Async%20Runtime-0f766e?style=for-the-badge)
+![Clap](https://img.shields.io/badge/CLI-clap-3b82f6?style=for-the-badge)
+![MIT License](https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.1.0-a855f7?style=for-the-badge)
+
 pico-tunnel 是一个极简反向隧道 CLI，使用 Rust + Tokio 实现。
 
 它的目标是把公网 Server 收到的 HTTP 请求，转发到 Client 所在机器的本地端口。
