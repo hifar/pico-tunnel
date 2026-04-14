@@ -6,7 +6,8 @@ pico-tunnel 是一个极简反向隧道 CLI，使用 Rust + Tokio 实现。
 
 ## 功能
 
-- Server 模式: 监听一个公网端口，接收外部请求和 Tunnel Client 连接
+- Server 模式: 监听一个控制端口，接收 Tunnel Client 连接
+- 按 Client 上报的映射端口，动态创建公网业务监听端口
 - Client 模式: 连接到 Server，建立反向隧道，将流量转发到本地服务
 - 基于 serv-key 的简单握手认证
 - 支持并发: 一个 Client 可维持多条连接，Server 可并发处理多个 HTTP 请求
@@ -15,11 +16,13 @@ pico-tunnel 是一个极简反向隧道 CLI，使用 Rust + Tokio 实现。
 
 - 入口命令:
   - `pico-tunnel server --serv-port <PORT> --serv-key <KEY>`
-  - `pico-tunnel client --port <LOCAL_PORT> --serv-host <HOST> --serv-port <PORT> --serv-key <KEY> [--connections <N>]`
-- Server 使用单端口模式:
-  - 同一端口同时接收两类连接:
-    - Tunnel Client 握手连接
-    - 外部 HTTP/TCP 请求连接
+  - `pico-tunnel client --port <LOCAL_PORT[:REMOTE_PORT]> --serv-host <HOST> --serv-port <PORT> --serv-key <KEY> [--connections <N>]`
+- `--port` 映射规则:
+  - `--port 3000` 等价于 `3000:3000`
+  - `--port 3000:3002` 表示客户端 `3000` 映射到服务端 `3002`
+- Server 监听模型:
+  - `serv-port` 仅用于 Client 控制连接与认证
+  - 业务请求走映射后的服务端端口（如 `3002`）
 - Client 默认维护 16 条工作连接 (`--connections` 可调整)
 - 每条工作连接一次处理一个转发会话，结束后自动重连
 
@@ -57,9 +60,17 @@ cargo run -- server --serv-port 8080 --serv-key 123456
 cargo run -- client --port 3000 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456
 ```
 
+如果希望访问 Server 的 3002 时转发到 Client 本地 3000:
+
+```bash
+cargo run -- client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456
+```
+
 ### 3. 从外部访问 Server
 
-向 `11.22.33.11:8080` 发送 HTTP 请求，流量会被转发到 Client 本地 `127.0.0.1:3000`。
+当使用 `--port 3000` 时，访问 `11.22.33.11:3000` 会被转发到 Client 本地 `127.0.0.1:3000`。
+
+当使用 `--port 3000:3002` 时，访问 `11.22.33.11:3002` 会被转发到 Client 本地 `127.0.0.1:3000`。
 
 ## 并发说明
 

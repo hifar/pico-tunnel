@@ -30,23 +30,35 @@ target/release/pico-tunnel server --serv-port 8080 --serv-key 123456
 
 启动后，Server 会监听 `0.0.0.0:8080`。
 
+说明: `8080` 是控制端口（用于 Client 建立隧道），不是业务访问端口。
+
 ## 3. 启动 Client（机器 B）
 
 ```bash
 target/release/pico-tunnel client --port 3000 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456
 ```
 
+上面命令表示: 本地 `3000` 映射到服务端 `3000`。
+
+如果希望本地 `3000` 映射到服务端 `3002`:
+
+```bash
+target/release/pico-tunnel client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456
+```
+
 参数说明:
 
-- `--port`: Client 本地服务端口
+- `--port`: 端口映射，支持两种写法
+  - `3000` 等价于 `3000:3000`
+  - `3000:3002` 表示 本地 `3000` -> 服务端 `3002`
 - `--serv-host`: Server 地址
-- `--serv-port`: Server 监听端口
+- `--serv-port`: Server 控制端口
 - `--serv-key`: 与 Server 一致的认证 key
 
 可选并发参数:
 
 ```bash
-target/release/pico-tunnel client --port 3000 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456 --connections 32
+target/release/pico-tunnel client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456 --connections 32
 ```
 
 ## 4. 验证转发
@@ -54,10 +66,16 @@ target/release/pico-tunnel client --port 3000 --serv-host 11.22.33.11 --serv-por
 在任意可访问 Server 的机器上执行:
 
 ```bash
-curl http://11.22.33.11:8080/
+curl http://11.22.33.11:3000/
 ```
 
 如果 Client 本地 `127.0.0.1:3000` 正常提供 HTTP 服务，应返回对应响应内容。
+
+如果使用的是 `--port 3000:3002`，验证命令改为:
+
+```bash
+curl http://11.22.33.11:3002/
+```
 
 ## 5. 常见问题
 
@@ -77,5 +95,5 @@ curl http://11.22.33.11:8080/
 ```bash
 cargo check
 cargo run -- server --serv-port 8080 --serv-key 123456
-cargo run -- client --port 3000 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456
+cargo run -- client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456
 ```
