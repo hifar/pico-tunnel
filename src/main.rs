@@ -9,13 +9,14 @@ use anyhow::{Context as AnyhowContext, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const HANDSHAKE_MAGIC: &[u8] = b"PICO-T1";
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_CONNECTIONS: usize = 16;
+const TUNNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(name = "pico-tunnel")]
@@ -53,7 +54,12 @@ struct ClientArgs {
     serv_port: u16,
     #[arg(long = "serv-key")]
     serv_key: String,
-    #[arg(long, default_value_t = DEFAULT_CONNECTIONS)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_CONNECTIONS,
+        value_parser = parse_connections,
+        help = "Number of concurrent tunnel workers"
+    )]
     connections: usize,
 }
 
@@ -93,23 +99,51 @@ fn parse_port_mapping(value: &str) -> Result<PortMapping, String> {
     })
 }
 
+fn parse_connections(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("invalid connections value: {value}"))?;
+    if parsed == 0 {
+        return Err("connections must be >= 1".to_string());
+    }
+    Ok(parsed)
+}
+
 struct TunnelPool {
     idle: Mutex<VecDeque<TcpStream>>,
+    notify: Notify,
 }
 
 impl TunnelPool {
     fn new() -> Self {
         Self {
             idle: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
         }
     }
 
     async fn push(&self, stream: TcpStream) {
         self.idle.lock().await.push_back(stream);
+        self.notify.notify_one();
     }
 
-    async fn pop(&self) -> Option<TcpStream> {
+    async fn pop_nowait(&self) -> Option<TcpStream> {
         self.idle.lock().await.pop_front()
+    }
+
+    async fn pop_wait(&self, wait_timeout: Duration) -> Option<TcpStream> {
+        timeout(wait_timeout, async {
+            loop {
+                let notified = self.notify.notified();
+                if let Some(stream) = self.pop_nowait().await {
+                    return stream;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .ok()
     }
 }
 
@@ -284,12 +318,12 @@ async fn handle_public_connection(
     remote_port: u16,
 ) -> Result<()> {
     let pool = state.pool_for(remote_port).await;
-    let Some(mut tunnel_socket) = pool.pop().await else {
+    let Some(mut tunnel_socket) = pool.pop_wait(TUNNEL_WAIT_TIMEOUT).await else {
         write_http_response(
             &mut incoming,
             503,
             "Service Unavailable",
-            "no tunnel client is currently connected\n",
+            "no tunnel client is currently connected or available within wait timeout\n",
         )
         .await?;
         return Ok(());
@@ -300,9 +334,14 @@ async fn handle_public_connection(
 }
 
 async fn run_client(args: ClientArgs) -> Result<()> {
-    let worker_count = args.connections.max(1);
+    let worker_count = args.connections;
     let shared_args = Arc::new(args);
     let mut workers = JoinSet::new();
+
+    println!(
+        "client workers: {}, local {} -> server {}",
+        worker_count, shared_args.port.local_port, shared_args.port.remote_port
+    );
 
     for worker_id in 0..worker_count {
         let shared_args = Arc::clone(&shared_args);

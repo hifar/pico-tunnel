@@ -83,7 +83,7 @@ cargo run -- client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --
 
 - Server 通过 Tokio 任务并发处理连接。
 - Client 通过 `--connections` 预建多个隧道 worker，提高并发能力。
-- 当没有可用 Client 隧道时，Server 返回 `503 Service Unavailable`。
+- 当没有可用 Client 隧道时，Server 会先排队等待（默认 5 秒），超时后返回 `503 Service Unavailable`。
 
 ## 失败场景与返回
 
