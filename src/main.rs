@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Context as AnyhowContext, Result, bail};
+use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,6 +18,7 @@ const HANDSHAKE_MAGIC: &[u8] = b"PICO-T1";
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_CONNECTIONS: usize = 16;
 const TUNNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_HEADER_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "pico-tunnel")]
@@ -38,6 +40,12 @@ struct ServerArgs {
     serv_port: u16,
     #[arg(long = "serv-key")]
     serv_key: String,
+    #[arg(long, default_value_t = false, help = "Enable Basic Auth on public ports")]
+    auth_enabled: bool,
+    #[arg(long = "auth-user", help = "Basic Auth username")]
+    auth_user: Option<String>,
+    #[arg(long = "auth-pass", help = "Basic Auth password")]
+    auth_pass: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -149,14 +157,16 @@ impl TunnelPool {
 
 struct ServerState {
     serv_key: String,
+    basic_auth: Option<BasicAuthConfig>,
     pools: Mutex<HashMap<u16, Arc<TunnelPool>>>,
     listeners: Mutex<HashSet<u16>>,
 }
 
 impl ServerState {
-    fn new(serv_key: String) -> Self {
+    fn new(serv_key: String, basic_auth: Option<BasicAuthConfig>) -> Self {
         Self {
             serv_key,
+            basic_auth,
             pools: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashSet::new()),
         }
@@ -168,6 +178,37 @@ impl ServerState {
             .entry(remote_port)
             .or_insert_with(|| Arc::new(TunnelPool::new()))
             .clone()
+    }
+}
+
+#[derive(Clone)]
+struct BasicAuthConfig {
+    user: String,
+    expected_token: String,
+}
+
+impl BasicAuthConfig {
+    fn from_server_args(args: &ServerArgs) -> Result<Option<Self>> {
+        if !args.auth_enabled {
+            return Ok(None);
+        }
+
+        let user = args
+            .auth_user
+            .as_ref()
+            .context("--auth-enabled requires --auth-user")?
+            .to_owned();
+        let pass = args
+            .auth_pass
+            .as_ref()
+            .context("--auth-enabled requires --auth-pass")?;
+        let token_source = format!("{user}:{pass}");
+        let expected_token = base64::engine::general_purpose::STANDARD.encode(token_source);
+
+        Ok(Some(Self {
+            user,
+            expected_token,
+        }))
     }
 }
 
@@ -234,12 +275,16 @@ async fn main() -> Result<()> {
 }
 
 async fn run_server(args: ServerArgs) -> Result<()> {
+    let basic_auth = BasicAuthConfig::from_server_args(&args)?;
     let listener = TcpListener::bind(("0.0.0.0", args.serv_port))
         .await
         .with_context(|| format!("failed to bind server port {}", args.serv_port))?;
-    let state = Arc::new(ServerState::new(args.serv_key));
+    let state = Arc::new(ServerState::new(args.serv_key, basic_auth));
 
     println!("server control listening on 0.0.0.0:{}", args.serv_port);
+    if let Some(auth) = &state.basic_auth {
+        println!("basic auth enabled for user '{}'", auth.user);
+    }
 
     loop {
         let (socket, peer_addr) = listener.accept().await.context("accept failed")?;
@@ -317,6 +362,22 @@ async fn handle_public_connection(
     state: Arc<ServerState>,
     remote_port: u16,
 ) -> Result<()> {
+    let initial_data = if let Some(auth) = &state.basic_auth {
+        let request_bytes = read_http_request_head(&mut incoming).await?;
+        if request_bytes.is_empty() {
+            return Ok(());
+        }
+
+        if !is_authorized_request(&request_bytes, auth) {
+            write_http_unauthorized(&mut incoming, &auth.user).await?;
+            return Ok(());
+        }
+
+        Some(request_bytes)
+    } else {
+        None
+    };
+
     let pool = state.pool_for(remote_port).await;
     let Some(mut tunnel_socket) = pool.pop_wait(TUNNEL_WAIT_TIMEOUT).await else {
         write_http_response(
@@ -329,7 +390,12 @@ async fn handle_public_connection(
         return Ok(());
     };
 
-    let _ = copy_bidirectional(&mut incoming, &mut tunnel_socket).await?;
+    if let Some(request_bytes) = initial_data {
+        let mut prefixed_incoming = PrefixedStream::new(request_bytes, incoming);
+        let _ = copy_bidirectional(&mut prefixed_incoming, &mut tunnel_socket).await?;
+    } else {
+        let _ = copy_bidirectional(&mut incoming, &mut tunnel_socket).await?;
+    }
     Ok(())
 }
 
@@ -440,6 +506,69 @@ async fn read_first_chunk(socket: &mut TcpStream) -> Result<Vec<u8>> {
     let bytes_read = socket.read(&mut buffer).await?;
     buffer.truncate(bytes_read);
     Ok(buffer)
+}
+
+async fn read_http_request_head(socket: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(1024);
+    let mut temp = vec![0_u8; 4096];
+
+    while data.len() < HTTP_HEADER_MAX_BYTES {
+        let bytes_read = socket.read(&mut temp).await?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        data.extend_from_slice(&temp[..bytes_read]);
+        if data.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    Ok(data)
+}
+
+fn is_authorized_request(request_bytes: &[u8], auth: &BasicAuthConfig) -> bool {
+    let request_text = String::from_utf8_lossy(request_bytes);
+    let expected_scheme = "Basic";
+
+    for raw_line in request_text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+
+        if !name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+
+        let mut parts = value.trim().split_whitespace();
+        let Some(scheme) = parts.next() else {
+            return false;
+        };
+        let Some(token) = parts.next() else {
+            return false;
+        };
+
+        return scheme.eq_ignore_ascii_case(expected_scheme) && token == auth.expected_token;
+    }
+
+    false
+}
+
+async fn write_http_unauthorized(socket: &mut TcpStream, realm: &str) -> Result<()> {
+    let body = "basic auth required\n";
+    let response = format!(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"{realm}\"\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    socket.write_all(response.as_bytes()).await?;
+    socket.flush().await?;
+    Ok(())
 }
 
 async fn write_http_response(

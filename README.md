@@ -15,6 +15,7 @@ pico-tunnel 是一个极简反向隧道 CLI，使用 Rust + Tokio 实现。
 
 - Server 模式: 监听一个控制端口，接收 Tunnel Client 连接
 - 按 Client 上报的映射端口，动态创建公网业务监听端口
+- 可选开启服务端 Basic Auth，保护未带登录能力的后端服务
 - Client 模式: 连接到 Server，建立反向隧道，将流量转发到本地服务
 - 基于 serv-key 的简单握手认证
 - 支持并发: 一个 Client 可维持多条连接，Server 可并发处理多个 HTTP 请求
@@ -22,7 +23,7 @@ pico-tunnel 是一个极简反向隧道 CLI，使用 Rust + Tokio 实现。
 ## 当前实现要点
 
 - 入口命令:
-  - `pico-tunnel server --serv-port <PORT> --serv-key <KEY>`
+  - `pico-tunnel server --serv-port <PORT> --serv-key <KEY> [--auth-enabled --auth-user <USER> --auth-pass <PASS>]`
   - `pico-tunnel client --port <LOCAL_PORT[:REMOTE_PORT]> --serv-host <HOST> --serv-port <PORT> --serv-key <KEY> [--connections <N>]`
 - `--port` 映射规则:
   - `--port 3000` 等价于 `3000:3000`
@@ -59,6 +60,12 @@ cargo check
 cargo run -- server --serv-port 8080 --serv-key 123456
 ```
 
+如果要开启 Basic Auth:
+
+```bash
+cargo run -- server --serv-port 8080 --serv-key 123456 --auth-enabled --auth-user admin --auth-pass 123456
+```
+
 ### 2. 启动 Client
 
 假设 Client 机器本地已有 HTTP 服务监听 3000 端口:
@@ -84,6 +91,13 @@ cargo run -- client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --
 - Server 通过 Tokio 任务并发处理连接。
 - Client 通过 `--connections` 预建多个隧道 worker，提高并发能力。
 - 当没有可用 Client 隧道时，Server 会先排队等待（默认 5 秒），超时后返回 `503 Service Unavailable`。
+
+## Basic Auth 说明
+
+- 默认关闭。
+- 开启方式: `--auth-enabled --auth-user <USER> --auth-pass <PASS>`。
+- 开启后，访问映射端口必须携带 `Authorization: Basic <token>`，否则返回 `401 Unauthorized`。
+- 认证仅保护 HTTP 请求头层面，不等价于 TLS 加密。
 
 ## 失败场景与返回
 
