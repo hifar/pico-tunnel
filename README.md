@@ -24,7 +24,7 @@ pico-tunnel 是一个极简反向隧道 CLI，使用 Rust + Tokio 实现。
 
 - 入口命令:
   - `pico-tunnel server --serv-port <PORT> --serv-key <KEY> [--debug] [--auth-enabled --auth-user <USER> --auth-pass <PASS>]`
-  - `pico-tunnel client --port <LOCAL_PORT[:REMOTE_PORT]> --serv-host <HOST> --serv-port <PORT> --serv-key <KEY> [--connections <N>]`
+  - `pico-tunnel client --port <LOCAL_PORT[:REMOTE_PORT]> --serv-host <HOST> --serv-port <PORT> --serv-key <KEY> [--debug] [--connections <N>]`
 - `--port` 映射规则:
   - `--port 3000` 等价于 `3000:3000`
   - `--port 3000:3002` 表示客户端 `3000` 映射到服务端 `3002`
@@ -86,6 +86,12 @@ cargo run -- client --port 3000 --serv-host 11.22.33.11 --serv-port 8080 --serv-
 cargo run -- client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456
 ```
 
+如果要开启客户端调试日志:
+
+```bash
+cargo run -- client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --serv-key 123456 --debug --connections 64
+```
+
 ### 3. 从外部访问 Server
 
 当使用 `--port 3000` 时，访问 `11.22.33.11:3000` 会被转发到 Client 本地 `127.0.0.1:3000`。
@@ -118,7 +124,7 @@ cargo run -- client --port 3000:3002 --serv-host 11.22.33.11 --serv-port 8080 --
   - 当前行为: 已降级为 debug 日志，不会中断正常转发。
 - `os error 10053 / 10054`
   - 常见原因: 浏览器主动中断、网络抖动、客户端本地服务关闭连接、隧道连接被中间网络设备回收。
-  - 建议: 开启 `--debug` 观察每次转发的开始/结束和字节数，定位是请求方中断还是后端中断。
+  - 建议: server/client 都开启 `--debug`，对照转发开始/结束和字节数，定位是请求方中断还是后端中断。
 
 ## 限制
 

@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as AnyhowContext, Result, bail};
 use base64::Engine;
@@ -65,6 +65,8 @@ struct ClientArgs {
     serv_port: u16,
     #[arg(long = "serv-key")]
     serv_key: String,
+    #[arg(long, default_value_t = false, help = "Enable verbose client debug logs")]
+    debug: bool,
     #[arg(
         long,
         default_value_t = DEFAULT_CONNECTIONS,
@@ -121,26 +123,59 @@ fn parse_connections(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+struct IdleStream {
+    stream: TcpStream,
+    pushed_at: Instant,
+}
+
 struct TunnelPool {
-    idle: Mutex<VecDeque<TcpStream>>,
+    idle: Mutex<VecDeque<IdleStream>>,
     notify: Notify,
 }
 
 impl TunnelPool {
-    fn new() -> Self {
-        Self {
+    fn new() -> Arc<Self> {
+        let pool = Arc::new(Self {
             idle: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
-        }
+        });
+        
+        let pool_clone = Arc::clone(&pool);
+        tokio::spawn(async move {
+            let max_idle = Duration::from_secs(60);
+            loop {
+                sleep(Duration::from_secs(30)).await;
+                let mut idle = pool_clone.idle.lock().await;
+                while let Some(front) = idle.front() {
+                    if front.pushed_at.elapsed() > max_idle {
+                        idle.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        });
+
+        pool
     }
 
     async fn push(&self, stream: TcpStream) {
-        self.idle.lock().await.push_back(stream);
+        self.idle.lock().await.push_back(IdleStream {
+            stream,
+            pushed_at: Instant::now(),
+        });
         self.notify.notify_one();
     }
 
     async fn pop_nowait(&self) -> Option<TcpStream> {
-        self.idle.lock().await.pop_front()
+        let mut idle = self.idle.lock().await;
+        // Skip over streams that somehow got too old
+        while let Some(s) = idle.pop_front() {
+            if s.pushed_at.elapsed() < Duration::from_secs(65) {
+                return Some(s.stream);
+            }
+        }
+        None
     }
 
     async fn pop_wait(&self, wait_timeout: Duration) -> Option<TcpStream> {
@@ -181,7 +216,7 @@ impl ServerState {
         let mut pools = self.pools.lock().await;
         pools
             .entry(remote_port)
-            .or_insert_with(|| Arc::new(TunnelPool::new()))
+            .or_insert_with(|| TunnelPool::new())
             .clone()
     }
 }
@@ -506,6 +541,9 @@ async fn run_client(args: ClientArgs) -> Result<()> {
         "client workers: {}, local {} -> server {}",
         worker_count, shared_args.port.local_port, shared_args.port.remote_port
     );
+    if shared_args.debug {
+        println!("client debug logging enabled");
+    }
 
     for worker_id in 0..worker_count {
         let shared_args = Arc::clone(&shared_args);
@@ -524,25 +562,55 @@ async fn run_client(args: ClientArgs) -> Result<()> {
 
 async fn run_client_worker_loop(worker_id: usize, args: Arc<ClientArgs>) -> Result<()> {
     loop {
-        if let Err(error) = run_client_worker_once(&args).await {
+        if let Err(error) = run_client_worker_once(worker_id, &args).await {
             eprintln!("client worker {worker_id} error: {error:#}");
             sleep(RECONNECT_DELAY).await;
         }
     }
 }
 
-async fn run_client_worker_once(args: &ClientArgs) -> Result<()> {
+async fn run_client_worker_once(worker_id: usize, args: &ClientArgs) -> Result<()> {
     let server_addr = format!("{}:{}", args.serv_host, args.serv_port);
+    debug_log(
+        args.debug,
+        format!("client worker {worker_id}: connecting to control server {server_addr}"),
+    );
     let mut tunnel_socket = TcpStream::connect(&server_addr)
         .await
         .with_context(|| format!("failed to connect to server {server_addr}"))?;
+    let server_peer = tunnel_socket
+        .peer_addr()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    debug_log(
+        args.debug,
+        format!("client worker {worker_id}: connected to server {server_peer}"),
+    );
 
     write_handshake(&mut tunnel_socket, &args.serv_key, args.port.remote_port).await?;
+    debug_log(
+        args.debug,
+        format!(
+            "client worker {worker_id}: handshake sent for local {} -> remote {}",
+            args.port.local_port, args.port.remote_port
+        ),
+    );
 
+    debug_log(
+        args.debug,
+        format!("client worker {worker_id}: waiting for forwarded request"),
+    );
     let first_chunk = read_first_chunk(&mut tunnel_socket).await?;
     if first_chunk.is_empty() {
         bail!("server closed the tunnel before forwarding any request")
     }
+    debug_log(
+        args.debug,
+        format!(
+            "client worker {worker_id}: received initial forwarded bytes from server: {} bytes",
+            first_chunk.len()
+        ),
+    );
 
     let mut local_socket = match TcpStream::connect(("127.0.0.1", args.port.local_port)).await {
         Ok(stream) => stream,
@@ -552,12 +620,39 @@ async fn run_client_worker_once(args: &ClientArgs) -> Result<()> {
                 args.port.local_port, error
             );
             write_http_response(&mut tunnel_socket, 502, "Bad Gateway", &body).await?;
+            debug_log(
+                args.debug,
+                format!(
+                    "client worker {worker_id}: local service connect failed on 127.0.0.1:{}: {}",
+                    args.port.local_port, error
+                ),
+            );
             bail!("failed to connect local service on port {}", args.port.local_port);
         }
     };
+    let local_peer = local_socket
+        .peer_addr()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    debug_log(
+        args.debug,
+        format!("client worker {worker_id}: connected to local backend {local_peer}"),
+    );
 
     let mut tunneled_request = PrefixedStream::new(first_chunk, tunnel_socket);
-    let _ = copy_bidirectional(&mut tunneled_request, &mut local_socket).await?;
+    debug_log(
+        args.debug,
+        format!("client worker {worker_id}: forwarding started"),
+    );
+    let (from_server_bytes, from_local_bytes) =
+        copy_bidirectional(&mut tunneled_request, &mut local_socket).await?;
+    debug_log(
+        args.debug,
+        format!(
+            "client worker {worker_id}: forwarding completed, server->local={} bytes, local->server={} bytes",
+            from_server_bytes, from_local_bytes
+        ),
+    );
     Ok(())
 }
 
