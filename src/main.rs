@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::pin::Pin;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -40,6 +41,8 @@ struct ServerArgs {
     serv_port: u16,
     #[arg(long = "serv-key")]
     serv_key: String,
+    #[arg(long, default_value_t = false, help = "Enable verbose server debug logs")]
+    debug: bool,
     #[arg(long, default_value_t = false, help = "Enable Basic Auth on public ports")]
     auth_enabled: bool,
     #[arg(long = "auth-user", help = "Basic Auth username")]
@@ -157,15 +160,17 @@ impl TunnelPool {
 
 struct ServerState {
     serv_key: String,
+    debug: bool,
     basic_auth: Option<BasicAuthConfig>,
     pools: Mutex<HashMap<u16, Arc<TunnelPool>>>,
     listeners: Mutex<HashSet<u16>>,
 }
 
 impl ServerState {
-    fn new(serv_key: String, basic_auth: Option<BasicAuthConfig>) -> Self {
+    fn new(serv_key: String, debug: bool, basic_auth: Option<BasicAuthConfig>) -> Self {
         Self {
             serv_key,
+            debug,
             basic_auth,
             pools: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashSet::new()),
@@ -178,6 +183,12 @@ impl ServerState {
             .entry(remote_port)
             .or_insert_with(|| Arc::new(TunnelPool::new()))
             .clone()
+    }
+}
+
+fn debug_log(enabled: bool, message: impl AsRef<str>) {
+    if enabled {
+        println!("[debug] {}", message.as_ref());
     }
 }
 
@@ -279,19 +290,23 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", args.serv_port))
         .await
         .with_context(|| format!("failed to bind server port {}", args.serv_port))?;
-    let state = Arc::new(ServerState::new(args.serv_key, basic_auth));
+    let state = Arc::new(ServerState::new(args.serv_key, args.debug, basic_auth));
 
     println!("server control listening on 0.0.0.0:{}", args.serv_port);
     if let Some(auth) = &state.basic_auth {
         println!("basic auth enabled for user '{}'", auth.user);
     }
+    if state.debug {
+        println!("server debug logging enabled");
+    }
 
     loop {
         let (socket, peer_addr) = listener.accept().await.context("accept failed")?;
         let state = Arc::clone(&state);
+        debug_log(state.debug, format!("control connection accepted from {peer_addr}"));
 
         tokio::spawn(async move {
-            if let Err(error) = handle_server_client_connection(socket, state).await {
+            if let Err(error) = handle_server_client_connection(socket, peer_addr, state).await {
                 eprintln!("server connection error from {peer_addr}: {error:#}");
             }
         });
@@ -300,15 +315,39 @@ async fn run_server(args: ServerArgs) -> Result<()> {
 
 async fn handle_server_client_connection(
     mut socket: TcpStream,
+    peer_addr: SocketAddr,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    let (key, remote_port) = read_handshake(&mut socket).await?;
+    let (key, remote_port) = match read_handshake(&mut socket).await {
+        Ok(v) => v,
+        Err(error) => {
+            if error.to_string().contains("invalid tunnel handshake magic") {
+                debug_log(
+                    state.debug,
+                    format!(
+                        "ignored non-tunnel traffic on control port from {peer_addr}: invalid handshake magic"
+                    ),
+                );
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+
     if key != state.serv_key {
+        debug_log(
+            state.debug,
+            format!("client auth failed from {peer_addr} for mapped port {remote_port}"),
+        );
         bail!("client authentication failed");
     }
 
     let pool = state.pool_for(remote_port).await;
     pool.push(socket).await;
+    debug_log(
+        state.debug,
+        format!("tunnel client registered: {peer_addr} => mapped server port {remote_port}"),
+    );
     ensure_public_listener(Arc::clone(&state), remote_port).await?;
     Ok(())
 }
@@ -345,7 +384,9 @@ async fn ensure_public_listener(state: Arc<ServerState>, remote_port: u16) -> Re
 
             let state = Arc::clone(&state);
             tokio::spawn(async move {
-                if let Err(error) = handle_public_connection(incoming, state, remote_port).await {
+                if let Err(error) =
+                    handle_public_connection(incoming, peer_addr, state, remote_port).await
+                {
                     eprintln!(
                         "forwarding failed on mapped port {remote_port} for {peer_addr}: {error:#}"
                     );
@@ -359,19 +400,40 @@ async fn ensure_public_listener(state: Arc<ServerState>, remote_port: u16) -> Re
 
 async fn handle_public_connection(
     mut incoming: TcpStream,
+    peer_addr: SocketAddr,
     state: Arc<ServerState>,
     remote_port: u16,
 ) -> Result<()> {
+    debug_log(
+        state.debug,
+        format!("incoming public request from {peer_addr} on mapped port {remote_port}"),
+    );
+
     let initial_data = if let Some(auth) = &state.basic_auth {
         let request_bytes = read_http_request_head(&mut incoming).await?;
         if request_bytes.is_empty() {
+            debug_log(
+                state.debug,
+                format!(
+                    "incoming request closed early before headers from {peer_addr} on mapped port {remote_port}"
+                ),
+            );
             return Ok(());
         }
 
         if !is_authorized_request(&request_bytes, auth) {
             write_http_unauthorized(&mut incoming, &auth.user).await?;
+            debug_log(
+                state.debug,
+                format!("basic auth rejected request from {peer_addr} on mapped port {remote_port}"),
+            );
             return Ok(());
         }
+
+        debug_log(
+            state.debug,
+            format!("basic auth accepted request from {peer_addr} on mapped port {remote_port}"),
+        );
 
         Some(request_bytes)
     } else {
@@ -379,6 +441,10 @@ async fn handle_public_connection(
     };
 
     let pool = state.pool_for(remote_port).await;
+    debug_log(
+        state.debug,
+        format!("waiting for tunnel worker for public request {peer_addr} on port {remote_port}"),
+    );
     let Some(mut tunnel_socket) = pool.pop_wait(TUNNEL_WAIT_TIMEOUT).await else {
         write_http_response(
             &mut incoming,
@@ -387,14 +453,46 @@ async fn handle_public_connection(
             "no tunnel client is currently connected or available within wait timeout\n",
         )
         .await?;
+        debug_log(
+            state.debug,
+            format!(
+                "no tunnel worker available within {:?} for request {peer_addr} on port {remote_port}",
+                TUNNEL_WAIT_TIMEOUT
+            ),
+        );
         return Ok(());
     };
 
+    let tunnel_peer = tunnel_socket
+        .peer_addr()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    debug_log(
+        state.debug,
+        format!(
+            "forwarding started for {peer_addr} via tunnel client {tunnel_peer} on mapped port {remote_port}"
+        ),
+    );
+
     if let Some(request_bytes) = initial_data {
         let mut prefixed_incoming = PrefixedStream::new(request_bytes, incoming);
-        let _ = copy_bidirectional(&mut prefixed_incoming, &mut tunnel_socket).await?;
+        let (upstream_bytes, downstream_bytes) =
+            copy_bidirectional(&mut prefixed_incoming, &mut tunnel_socket).await?;
+        debug_log(
+            state.debug,
+            format!(
+                "forwarding completed for {peer_addr} on mapped port {remote_port}, req->client={upstream_bytes} bytes, client->req={downstream_bytes} bytes"
+            ),
+        );
     } else {
-        let _ = copy_bidirectional(&mut incoming, &mut tunnel_socket).await?;
+        let (upstream_bytes, downstream_bytes) =
+            copy_bidirectional(&mut incoming, &mut tunnel_socket).await?;
+        debug_log(
+            state.debug,
+            format!(
+                "forwarding completed for {peer_addr} on mapped port {remote_port}, req->client={upstream_bytes} bytes, client->req={downstream_bytes} bytes"
+            ),
+        );
     }
     Ok(())
 }
