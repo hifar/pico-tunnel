@@ -54,11 +54,12 @@ struct ServerArgs {
 #[derive(Args, Debug, Clone)]
 struct ClientArgs {
     #[arg(
-        long,
+        long = "port",
         value_parser = parse_port_mapping,
-        help = "Port mapping: <local> or <local>:<remote>, e.g. 3000 or 3000:3002"
+        value_delimiter = ',',
+        help = "Port mapping: <local> or <local>:<remote>, e.g. 3000 or 3000:3002. Use commas for multiple mappings."
     )]
-    port: PortMapping,
+    port: Vec<PortMapping>,
     #[arg(long = "serv-host")]
     serv_host: String,
     #[arg(long = "serv-port")]
@@ -537,17 +538,20 @@ async fn run_client(args: ClientArgs) -> Result<()> {
     let shared_args = Arc::new(args);
     let mut workers = JoinSet::new();
 
-    println!(
-        "client workers: {}, local {} -> server {}",
-        worker_count, shared_args.port.local_port, shared_args.port.remote_port
-    );
     if shared_args.debug {
         println!("client debug logging enabled");
     }
 
-    for worker_id in 0..worker_count {
-        let shared_args = Arc::clone(&shared_args);
-        workers.spawn(async move { run_client_worker_loop(worker_id, shared_args).await });
+    for pm in &shared_args.port {
+        println!(
+            "client workers: {}, local {} -> server {}",
+            worker_count, pm.local_port, pm.remote_port
+        );
+        for worker_id in 0..worker_count {
+            let shared_args = Arc::clone(&shared_args);
+            let port_copy = *pm;
+            workers.spawn(async move { run_client_worker_loop(worker_id, shared_args, port_copy).await });
+        }
     }
 
     loop {
@@ -560,16 +564,16 @@ async fn run_client(args: ClientArgs) -> Result<()> {
     }
 }
 
-async fn run_client_worker_loop(worker_id: usize, args: Arc<ClientArgs>) -> Result<()> {
+async fn run_client_worker_loop(worker_id: usize, args: Arc<ClientArgs>, port: PortMapping) -> Result<()> {
     loop {
-        if let Err(error) = run_client_worker_once(worker_id, &args).await {
-            eprintln!("client worker {worker_id} error: {error:#}");
+        if let Err(error) = run_client_worker_once(worker_id, &args, port).await {
+            eprintln!("client worker {worker_id} ({}->{}): {error:#}", port.local_port, port.remote_port);
             sleep(RECONNECT_DELAY).await;
         }
     }
 }
 
-async fn run_client_worker_once(worker_id: usize, args: &ClientArgs) -> Result<()> {
+async fn run_client_worker_once(worker_id: usize, args: &ClientArgs, port: PortMapping) -> Result<()> {
     let server_addr = format!("{}:{}", args.serv_host, args.serv_port);
     debug_log(
         args.debug,
@@ -587,12 +591,12 @@ async fn run_client_worker_once(worker_id: usize, args: &ClientArgs) -> Result<(
         format!("client worker {worker_id}: connected to server {server_peer}"),
     );
 
-    write_handshake(&mut tunnel_socket, &args.serv_key, args.port.remote_port).await?;
+    write_handshake(&mut tunnel_socket, &args.serv_key, port.remote_port).await?;
     debug_log(
         args.debug,
         format!(
             "client worker {worker_id}: handshake sent for local {} -> remote {}",
-            args.port.local_port, args.port.remote_port
+            port.local_port, port.remote_port
         ),
     );
 
@@ -612,22 +616,22 @@ async fn run_client_worker_once(worker_id: usize, args: &ClientArgs) -> Result<(
         ),
     );
 
-    let mut local_socket = match TcpStream::connect(("127.0.0.1", args.port.local_port)).await {
+    let mut local_socket = match TcpStream::connect(("127.0.0.1", port.local_port)).await {
         Ok(stream) => stream,
         Err(error) => {
             let body = format!(
                 "local service 127.0.0.1:{} is unavailable: {}\n",
-                args.port.local_port, error
+                port.local_port, error
             );
             write_http_response(&mut tunnel_socket, 502, "Bad Gateway", &body).await?;
             debug_log(
                 args.debug,
                 format!(
                     "client worker {worker_id}: local service connect failed on 127.0.0.1:{}: {}",
-                    args.port.local_port, error
+                    port.local_port, error
                 ),
             );
-            bail!("failed to connect local service on port {}", args.port.local_port);
+            bail!("failed to connect local service on port {}", port.local_port);
         }
     };
     let local_peer = local_socket
